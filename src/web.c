@@ -2,6 +2,7 @@
 #include "ps5_vpad.h"
 #include "shellui_inject.h"
 #include "bt_host.h"
+#include "usb_hotplug.h"
 #include "version.h"
 #include "log.h"
 #include "util.h"
@@ -182,10 +183,30 @@ static void handle_client(int cfd)
     int pr = poll(&pfd, 1, 100);
     if (pr <= 0) { close(cfd); return; }
 
-    char req[2048];
+    char req[4096];
     ssize_t n = read(cfd, req, sizeof(req) - 1);
     if (n <= 0) { close(cfd); return; }
     req[n] = '\0';
+    /* A POST body may come in a later packet than the headers: keep reading
+     * (up to 150 ms; this runs on the main loop) until Content-Length bytes are in. */
+    {
+        char *hdr_end = strstr(req, "\r\n\r\n");
+        const char *cl = strstr(req, "Content-Length:");
+        if (!cl) cl = strstr(req, "content-length:");
+        if (hdr_end && cl && cl < hdr_end) {
+            long want = atol(cl + 15);
+            long have = (long)(req + n - (hdr_end + 4));
+            while (want > have && n < (ssize_t)sizeof(req) - 1) {
+                struct pollfd more = { .fd = cfd, .events = POLLIN };
+                if (poll(&more, 1, 150) <= 0) break;
+                ssize_t m = read(cfd, req + n, sizeof(req) - 1 - (size_t)n);
+                if (m <= 0) break;
+                n += m;
+                have += m;
+                req[n] = '\0';
+            }
+        }
+    }
 
     char res[4096];
     int res_len = 0;
@@ -216,15 +237,21 @@ static void handle_client(int cfd)
              * the right picture and that controller's own settings. */
             uint16_t vid = 0, pid = 0;
             unsigned char mac[6] = {0};
-            int bt = bt_host_slot_ids(i, &vid, &pid, mac);
-            char macs[18] = "";
-            if (bt) snprintf(macs, sizeof macs, "%02X:%02X:%02X:%02X:%02X:%02X", mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+            char macs[18] = "", sid[20] = "";
+            int is_usb = info.conn_type == CONN_USB_WIRED || info.conn_type == CONN_USB_DONGLE_24G;
+            if (info.status == VP_READY && !is_usb && bt_host_slot_ids(i, &vid, &pid, mac)) {
+                snprintf(macs, sizeof macs, "%02X:%02X:%02X:%02X:%02X:%02X", mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+                snprintf(sid, sizeof sid, "%02X%02X%02X%02X%02X%02X", mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+            } else if (info.status == VP_READY && is_usb && usb_hotplug_slot_ids(i, &vid, &pid)) {
+                /* USB pads have no unique id: settings are per model. */
+                snprintf(sid, sizeof sid, "USB_%04X_%04X", vid, pid);
+            }
             jlen += snprintf(json + jlen, sizeof(json) - (size_t)jlen,
-                "%s{\"status\":%d,\"name\":\"%s\",\"conn\":%d,\"handle\":%d,\"alt_handle\":%d,\"user_id\":%u,\"battery\":%d,\"charging\":%d,\"injected\":%u,\"vid\":%u,\"pid\":%u,\"mac\":\"%s\"}",
+                "%s{\"status\":%d,\"name\":\"%s\",\"conn\":%d,\"handle\":%d,\"alt_handle\":%d,\"user_id\":%u,\"battery\":%d,\"charging\":%d,\"injected\":%u,\"vid\":%u,\"pid\":%u,\"mac\":\"%s\",\"id\":\"%s\"}",
                 i > 0 ? "," : "",
                 info.status, info.name, info.conn_type, info.handle, info.alt_handle,
                 (unsigned)info.user_id, info.battery_level, info.battery_charging,
-                (unsigned)info.packets_injected, vid, pid, macs);
+                (unsigned)info.packets_injected, vid, pid, macs, sid);
         }
         snprintf(json + jlen, sizeof(json) - (size_t)jlen, "]}");
 
@@ -646,11 +673,11 @@ static void handle_client(int cfd)
     }
     /* ---- Mapping (per-controller button remap) endpoints ---- */
     else if (strncmp(req, "GET /api/mapping/", 17) == 0) {
-        char path[256]; char id[16] = {0};
+        char path[256]; char id[24] = {0};
         /* Pull VVVV_PPPP token after /api/mapping/ */
         const char *p = req + 17;
         size_t n_id = 0;
-        while (n_id + 1 < sizeof id && isalnum((unsigned char)*p)) id[n_id++] = *p++;
+        while (n_id + 1 < sizeof id && (isalnum((unsigned char)*p) || *p == '_')) id[n_id++] = *p++;
         snprintf(path, sizeof path, BT_MAP_DIR "/%s.map", id);
         FILE *f = fopen(path, "r");
         if (f) {
@@ -689,10 +716,10 @@ static void handle_client(int cfd)
     }
     else if (strncmp(req, "POST /api/mapping/", 18) == 0) {
         /* Dashboard POSTs a flat JSON object; we persist it as key=value lines. */
-        char id[16] = {0};
+        char id[24] = {0};
         const char *p = req + 18;
         size_t n_id = 0;
-        while (n_id + 1 < sizeof id && isalnum((unsigned char)*p)) id[n_id++] = *p++;
+        while (n_id + 1 < sizeof id && (isalnum((unsigned char)*p) || *p == '_')) id[n_id++] = *p++;
         char *body_start = strstr(req, "\r\n\r\n");
         if (body_start) body_start += 4; else body_start = (char*)req + n;
         mkdir("/data/omnipad", 0755);

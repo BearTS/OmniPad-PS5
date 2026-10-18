@@ -1,4 +1,5 @@
 #include "ps5_vpad.h"
+#include "remap.h"
 #include "shellui_inject.h"
 #include "log.h"
 #include "util.h"
@@ -830,9 +831,32 @@ int vpad_slot_is_free(int slot)
     return g_slots[slot].status == VP_FREE;
 }
 
+static uint32_t g_remap[MAX_SLOTS][REMAP_N];
+static volatile int g_remap_on[MAX_SLOTS];
+
+void vpad_set_remap(int slot, const uint32_t *map)
+{
+    if (slot < 0 || slot >= MAX_SLOTS) return;
+    int on = 0;
+    g_remap_on[slot] = 0;               /* readers fall back to the auto layout while it changes */
+    for (int i = 0; i < REMAP_N; i++) {
+        g_remap[slot][i] = map ? map[i] : remap_bits[i];
+        if (g_remap[slot][i] != remap_bits[i]) on = 1;
+    }
+    g_remap_on[slot] = on;
+}
+
 void vpad_update(int slot, const pad_state_t *st)
 {
     if (!st || slot < 0 || slot >= MAX_SLOTS) return;
+
+    /* User overrides on top of the auto-detected layout (remap.h). */
+    pad_state_t remapped;
+    if (g_remap_on[slot]) {
+        remapped = *st;
+        remap_apply(g_remap[slot], &remapped);
+        st = &remapped;
+    }
 
     static uint32_t s_prev_btn[MAX_SLOTS] = {0};
     uint32_t prev = s_prev_btn[slot];

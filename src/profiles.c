@@ -878,6 +878,7 @@ static int u2_map_line(u2_ctx *c, char *line)
     key = u2_trim(line);
     val = u2_trim(eq + 1);
     if (strcmp(key, "weak_mix") == 0) return 1;     /* older files: weak rumble always goes to the main motor now */
+    if (strncmp(key, "remap_", 6) == 0) return 1;   /* OmniPad: button overrides, read by remap.c */
     if (strcmp(key, "motion") == 0 || strcmp(key, "small_motor") == 0) {
         int *flag = key[0] == 'm' ? &c->motion : &c->small_motor;
         if (strcmp(val, "on") == 0) *flag = 1;

@@ -20,6 +20,8 @@
 #include "ps5_vpad.h"
 #include "ps5_haptic.h"
 #include "profiles.h"
+#include "usb_hotplug.h"
+#include "remap.h"
 #include "log.h"
 #include "util.h"
 
@@ -198,6 +200,16 @@ static int read_small_motor(const unsigned char mac[6])
     return on;
 }
 
+/* This controller's button overrides, from <map dir>/AABBCCDDEEFF.map. */
+static void bt_apply_remap(int slot, const unsigned char mac[6])
+{
+    char id[16];
+    uint32_t map[REMAP_N];
+    snprintf(id, sizeof id, "%02X%02X%02X%02X%02X%02X", mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+    remap_load(id, map);
+    vpad_set_remap(slot, map);
+}
+
 static void on_connect(void *ud, int slot, const pad_info *info)
 {
     char name[64];
@@ -220,6 +232,7 @@ static void on_connect(void *ud, int slot, const pad_info *info)
 
     if (!vpad_add(slot, CONN_BLUETOOTH_CLASSIC, name))
         log_line("bt: slot %d vpad_add failed", slot);
+    bt_apply_remap(slot, info->addr);
 }
 
 static void on_state(void *ud, int slot, const pad_state *st)
@@ -343,9 +356,14 @@ static uint8_t apply_gain(uint8_t v, float gain)
 
 void bt_haptic_pump(void)
 {
-    if (!g_haptic_enabled || !g_haptic_started || !g.up) return;
-    int any = 0;
-    for (int i = 0; i < HOST_MAX_PADS; i++) if (g.live[i]) { any = 1; break; }
+    static int usb_zeroed = 1;
+    if (!g_haptic_enabled || !g_haptic_started) {
+        /* Bridge off: make sure USB pads are left still. */
+        if (!usb_zeroed) { for (int i = 0; i < MAX_SLOTS; i++) usb_hotplug_set_rumble(i, 0, 0); usb_zeroed = 1; }
+        return;
+    }
+    int any = usb_hotplug_any();
+    if (g.up) for (int i = 0; i < HOST_MAX_PADS; i++) if (g.live[i]) { any = 1; break; }
     /* Eager mode keeps the stream warm regardless of pad presence so there's
      * no 1-2 s Avcap2 cold-start when a game first rumbles. */
     haptic_want(g_haptic_eager ? 1 : any);
@@ -357,10 +375,15 @@ void bt_haptic_pump(void)
     /* Send every tick; host_set_rumble is already a change-only transport
      * for the actual over-air write, and sending the current level each
      * tick lets small-amplitude transitions through promptly. */
-    for (int i = 0; i < HOST_MAX_PADS; i++) {
-        if (!g.live[i]) continue;
-        host_set_rumble(g.host, i, s, g.small_motor[i] ? w : 0);
+    if (g.up) {
+        for (int i = 0; i < HOST_MAX_PADS; i++) {
+            if (!g.live[i]) continue;
+            host_set_rumble(g.host, i, s, g.small_motor[i] ? w : 0);
+        }
     }
+    /* USB pads: the reader thread applies that pad's small-motor setting. */
+    for (int i = 0; i < MAX_SLOTS; i++) usb_hotplug_set_rumble(i, s, w);
+    usb_zeroed = 0;
 }
 
 int bt_host_pair_mac(const unsigned char mac[6], int seconds)
@@ -601,11 +624,13 @@ int bt_host_slot_ids(int slot, uint16_t *vid, uint16_t *pid, unsigned char mac[6
 
 void bt_host_reload_configs(void)
 {
+    usb_hotplug_reload_configs();
     if (!g.up || !g.host) return;
     host_pad_reload(g.host);
     for (int i = 0; i < HOST_MAX_PADS; i++) {
         if (!g.live[i]) continue;
         g.small_motor[i] = read_small_motor(g.mac[i]);
+        bt_apply_remap(i, g.mac[i]);
     }
 }
 
