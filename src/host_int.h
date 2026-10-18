@@ -204,6 +204,7 @@ typedef struct {
     int connected;          /* the ACL link is up */
     unsigned handle;
     int pairing;            /* we found it in pairing mode */
+    int recall;             /* OmniPad: we paged this stored pad from the web page */
     long t_create, t_conn;
 
     int auth_sent, auth_ok, enc_sent, enc_on;

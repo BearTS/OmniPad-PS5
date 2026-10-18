@@ -134,7 +134,7 @@ int main(int argc, char **argv)
     mkdir("/data/omnipad", 0755);
     mkdir("/data/omnipad/maps", 0755);
     extern void profiles_set_map_dir(const char *);
-    profiles_set_map_dir("/data/omnipad/maps");
+    profiles_set_map_dir(BT_MAP_DIR);
     log_line("main: Bluetooth host staged; use the dashboard to enable pairing");
 
     /* 4. Initialize Web Dashboard */

@@ -92,4 +92,5 @@ temp/
 tmp/
 
 # OmniPad port additions
-src/web_mappings.h       # generated from web/mappings.html by Python prebuild
+# generated from web/index.html by tools/embed_html.py
+src/web_page.c

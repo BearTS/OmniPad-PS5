@@ -827,9 +827,25 @@ typedef struct {
     uint32_t extra[U2_EXTRA];
     int motion;
     int small_motor;    /* also drive the small right motor (on a real pad it only buzzes faintly) */
+    unsigned char addr[6];  /* OmniPad: this controller's address, for its own settings file */
+    int has_addr;
 } u2_ctx;
 
 static char g_map_dir[256];
+static unsigned char g_setup_addr[6];
+static int g_setup_addr_set;
+
+void profiles_set_setup_addr(const unsigned char *addr)
+{
+    g_setup_addr_set = addr != NULL;
+    if (addr) memcpy(g_setup_addr, addr, 6);
+}
+
+/* <map dir>/AABBCCDDEEFF.map: the address as shown, most significant first. */
+static void u2_addr_path(char *path, size_t n, const unsigned char *a)
+{
+    snprintf(path, n, "%s/%02X%02X%02X%02X%02X%02X.map", g_map_dir, a[5], a[4], a[3], a[2], a[1], a[0]);
+}
 
 void profiles_set_map_dir(const char *dir)
 {
@@ -891,10 +907,20 @@ static void u2_setup(void *ctx, uint16_t vid, uint16_t pid)
     c->extra[U2_PR] = PAD_R3;
     c->motion = 0;
     c->small_motor = 0;
+    c->has_addr = g_setup_addr_set;
+    if (g_setup_addr_set) memcpy(c->addr, g_setup_addr, 6);
 
     if (!g_map_dir[0]) return;
-    snprintf(path, sizeof path, "%s/%04X_%04X.map", g_map_dir, vid, pid);
-    f = fopen(path, "r");
+    /* This controller's own settings first, then the model's. */
+    f = NULL;
+    if (c->has_addr) {
+        u2_addr_path(path, sizeof path, c->addr);
+        f = fopen(path, "r");
+    }
+    if (!f) {
+        snprintf(path, sizeof path, "%s/%04X_%04X.map", g_map_dir, vid, pid);
+        f = fopen(path, "r");
+    }
     if (!f) return;
     while (fgets(line, sizeof line, f)) {
         no++;
@@ -933,7 +959,8 @@ static int u2_config_set(void *ctx, uint16_t vid, uint16_t pid, const char *key,
     snprintf(line, sizeof line, "%s = %s", key, val);
     if (!u2_map_line(c, line) || strchr(key, '#') || !*key) { *c = saved; return 0; }
     if (!g_map_dir[0]) return 1;
-    snprintf(path, sizeof path, "%s/%04X_%04X.map", g_map_dir, vid, pid);
+    if (c->has_addr) u2_addr_path(path, sizeof path, c->addr);
+    else snprintf(path, sizeof path, "%s/%04X_%04X.map", g_map_dir, vid, pid);
     f = fopen(path, "w");
     if (!f) {
         log_line("map %s: could not be written (the setting stays until AnyPad stops)", path);

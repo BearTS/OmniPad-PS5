@@ -61,6 +61,41 @@ int  bt_host_discovered(bt_discovered_t *out, int max);
  * brought up or `mac` is NULL / all-zero. */
 int  bt_host_pair_mac(const unsigned char mac[6], int seconds);
 
+/* Open a wide pairing window (no MAC filter). Brings the radio up first. */
+int  bt_host_scan(int seconds);
+
+/* ---- Remembered pads (OmniPad extension) --------------------------------
+ * Pads paired earlier keep their link key in the store. A pad that is also
+ * used with another device (phone, PC) usually calls whatever it was last
+ * linked to, so it will not come back here by itself. Reconnect:
+ *   1. brings the radio up and calls the pad for ~30 s with its stored key
+ *      (the pad must be switched on and not linked elsewhere);
+ *   2. if the pad does not answer, or answers but lost our key because it
+ *      was paired with another device since, opens a 90 s pairing window
+ *      for that pad only: hold its pairing button and it is paired afresh.
+ * Works with the radio released too: the list is read from the store file. */
+typedef struct {
+    unsigned char mac[6];
+    uint16_t vid, pid;
+    int le;
+    int connected;
+    const char *name;           /* profile name, or NULL if unknown */
+} bt_paired_t;
+
+int  bt_host_paired(bt_paired_t *out, int max);
+
+/* Where per-controller and per-model settings files live. */
+#define BT_MAP_DIR "/data/omnipad/maps"
+/* Identity of the pad in a live BT slot. Returns 0 if the slot is not a live BT pad. */
+int  bt_host_slot_ids(int slot, uint16_t *vid, uint16_t *pid, unsigned char mac[6]);
+/* Apply saved settings files to connected pads now (after the page saves one). */
+void bt_host_reload_configs(void);
+/* Returns 1 started, 0 not paired, -1 radio could not be brought up. */
+int  bt_host_reconnect(const unsigned char mac[6]);
+void bt_host_reconnect_cancel(void);
+/* Reconnect progress as a JSON object into out; returns its length. */
+int  bt_host_reconnect_json(char *out, int n);
+
 /* ---- Game-rumble bridge (haptic-audio capture) --------------------------
  * Opt-in Avcap2 bridge: reads the haptic signal the console would send to a
  * DualSense's actuators (even for games that don't call scePadSetVibration)

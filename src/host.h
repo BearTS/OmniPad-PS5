@@ -108,6 +108,20 @@ int  host_pad_get(const host_t *h, int slot, pad_info *info, pad_state *st);
 int  host_pad_config(const host_t *h, int slot, char *out, int n);
 int  host_pad_config_set(host_t *h, int slot, const char *key, const char *val);
 
+/* OmniPad: pages a stored (paired) classic pad, for a pad that does not
+ * call the console by itself, e.g. one last used with another device.
+ * It is authenticated with its stored key like a pad that reconnects.
+ * Returns 1 if the page was sent, 0 if the address is not paired, -1 if
+ * not possible now (a search or another link is being set up, LE pad, or
+ * it is already linked). */
+int  host_recall(host_t *h, const unsigned char addr[6]);
+/* OmniPad: re-reads the saved settings of every connected pad. */
+int  host_pad_reload(host_t *h);
+/* 1 if a link to addr exists in any state (paging, setting up, ready). */
+int  host_link_exists(const host_t *h, const unsigned char addr[6]);
+/* 1 if addr is in the paired store. */
+int  host_is_paired(const host_t *h, const unsigned char addr[6]);
+
 /* Forgets a paired pad: disconnects it if linked and drops its keys.
  * Returns 0 if it was not paired. */
 int  host_forget(host_t *h, const unsigned char addr[6]);

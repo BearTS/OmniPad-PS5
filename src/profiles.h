@@ -66,6 +66,10 @@ const pad_profile *profile_find(uint16_t vid, uint16_t pid);
 
 /* Where profiles with a settings file look for it (<dir>/VVVV_PPPP.map). */
 void profiles_set_map_dir(const char *dir);
+/* OmniPad: the Bluetooth address of the pad whose profile setup() runs next
+ * (NULL clears it). Profiles with settings then load and save them per
+ * controller, <map dir>/AABBCCDDEEFF.map, before the per-model file. */
+void profiles_set_setup_addr(const unsigned char *addr);
 
 /* A PlayStation button by its mapping-file name ("cross", "touchpad", "l3",
  * "none"...). Returns 0 if the name is unknown. */

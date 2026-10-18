@@ -1131,6 +1131,7 @@ static void on_acl(host_t *h, const unsigned char *pkt, int len)
 /* ---- HCI events ----------------------------------------------------------- */
 
 static int is_banned(const host_t *h, const unsigned char *addr);
+static const unsigned char *link_identity(const link_t *l);
 
 static void send_io_cap_reply(host_t *h, const unsigned char *addr)
 {
@@ -1698,6 +1699,16 @@ static void on_event(host_t *h, const unsigned char *ev, int len)
             break;
         }
         if (len < 6 || ev[2] == 0) break;
+        if (le16(ev + 4) == OP_CREATE_CONNECTION) {
+            /* A page we made from the web page was refused at once. */
+            for (i = 0; i < HOST_MAX_PADS; i++) {
+                l = &h->links[i];
+                if (l->used && l->recall && !l->connected) {
+                    log_line("pad %s: call from the web page refused (status %#04x)", addr_str(l->addr), ev[2]);
+                    link_free(h, l);
+                }
+            }
+        }
         if (le16(ev + 4) == OP_CREATE_CONNECTION && ev[2] == 0x0B) report_existing_link(h);
         if (le16(ev + 4) == OP_CREATE_CONNECTION || le16(ev + 4) == 0x200D) {
             int want_le = le16(ev + 4) == 0x200D;
@@ -1901,7 +1912,11 @@ static void link_step(host_t *h, link_t *l, long now)
     }
     if (l->ids_known && !l->prof && !l->sdp_query) {
         l->prof = profile_find(l->vid, l->pid);
-        if (l->prof && l->prof->setup) l->prof->setup(l->pctx.bytes, l->vid, l->pid);
+        if (l->prof && l->prof->setup) {
+            profiles_set_setup_addr(link_identity(l));
+            l->prof->setup(l->pctx.bytes, l->vid, l->pid);
+            profiles_set_setup_addr(NULL);
+        }
         if (!l->prof) {
             log_line("pad %s: %04x:%04x has no profile, reading its HID descriptor",
                      addr_str(l->addr), l->vid, l->pid);
@@ -2732,4 +2747,73 @@ void host_set_allowed_mac(host_t *h, const unsigned char mac[6])
     if (!h) return;
     if (mac) memcpy(h->allowed_mac, mac, 6);
     else memset(h->allowed_mac, 0, 6);
+}
+
+/* ---- OmniPad extension: call a stored pad from the web page -------------- */
+
+int host_is_paired(const host_t *h, const unsigned char addr[6])
+{
+    int i;
+    for (i = 0; i < h->ndb; i++)
+        if (memcmp(h->db[i].addr, addr, 6) == 0) return 1;
+    return 0;
+}
+
+int host_link_exists(const host_t *h, const unsigned char addr[6])
+{
+    int k;
+    for (k = 0; k < HOST_MAX_PADS; k++) {
+        const link_t *l = &h->links[k];
+        if (l->used && (memcmp(l->addr, addr, 6) == 0 || memcmp(link_identity(l), addr, 6) == 0)) return 1;
+    }
+    return 0;
+}
+
+int host_recall(host_t *h, const unsigned char addr[6])
+{
+    unsigned char p[13];
+    db_rec *r;
+    link_t *l;
+    int k;
+
+    if (!h || h->dead) return -1;
+    r = db_find(h, addr);
+    if (!r) return 0;
+    if (r->le) return -1;                       /* LE pads advertise; they are not paged */
+    if (host_link_exists(h, addr)) return -1;
+    if (pairing_busy(h, now_ms())) return -1;   /* a search owns the radio */
+    for (k = 0; k < HOST_MAX_PADS; k++)
+        if (h->links[k].used && !h->links[k].ready) return -1;   /* one link set up at a time */
+    l = link_new(h, addr);
+    if (!l) return -1;
+    l->recall = 1;
+    memcpy(p, addr, 6);
+    put16(p + 6, 0xCC18);                       /* DM1..DH5 */
+    p[8] = 0x02;                                /* page scan mode unknown: R2 pages longest */
+    p[9] = 0;
+    put16(p + 10, 0);                           /* no clock offset known */
+    p[12] = 1;                                  /* allow role switch */
+    send_cmd(h, OP_CREATE_CONNECTION, p, 13);
+    log_line("pad %s: calling it (reconnect from the web page)", addr_str(addr));
+    return 1;
+}
+
+/* OmniPad: re-reads the settings of every connected pad whose profile has
+ * any (its own file, else its model's), so a mapping saved from the page
+ * applies at once. Returns how many pads were reloaded. */
+int host_pad_reload(host_t *h)
+{
+    int k, n = 0;
+
+    if (!h) return 0;
+    for (k = 0; k < HOST_MAX_PADS; k++) {
+        link_t *l = &h->links[k];
+        if (!l->used || !l->ready || !l->prof || !l->prof->setup || !l->prof->config_json) continue;
+        profiles_set_setup_addr(link_identity(l));
+        l->prof->setup(l->pctx.bytes, l->vid, l->pid);
+        profiles_set_setup_addr(NULL);
+        n++;
+    }
+    if (n) log_line("settings reloaded for %d pad(s)", n);
+    return n;
 }
