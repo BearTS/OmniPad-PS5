@@ -39,4 +39,11 @@ void vpad_press_ps_button(int slot);
 int vpad_rebind_user(int slot, int32_t user_id);
 void vpad_cleanup_all(void);
 
+/* Device-type knob: 3 = DualSense (default), 2 = DualShock 4 ABI. Both
+ * usually come back as kernel subType:22 (DualSense) on current firmware;
+ * flipping to 2 is an experiment to see if the game's rumble routing
+ * differs (DS4 only uses the simple-rumble path). */
+int  vpad_get_device_type(void);
+void vpad_set_device_type(int type);
+
 #endif /* PS5_VPAD_H */

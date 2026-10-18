@@ -18,6 +18,20 @@
 #include <pthread.h>
 
 #define VIRTUAL_DEVICE_DUALSENSE 3
+#define VIRTUAL_DEVICE_DUALSHOCK 2
+
+/* Which device type the next AddDevice uses. Can be flipped at runtime from
+ * the web dashboard via vpad_set_device_type(). Takes effect on the next
+ * virtual pad creation; existing live slots keep whatever they were made
+ * with. */
+static int g_vpad_device_type = VIRTUAL_DEVICE_DUALSENSE;
+
+int vpad_get_device_type(void) { return g_vpad_device_type; }
+void vpad_set_device_type(int type)
+{
+    if (type == VIRTUAL_DEVICE_DUALSENSE || type == VIRTUAL_DEVICE_DUALSHOCK)
+        g_vpad_device_type = type;
+}
 #define T_IDENTIFY               3000   /* ms to wait for DEVICE_ADDED */
 #define T_AMBIGUITY               300   /* ms after match before committing */
 #define LINE_MAX_LEN             1024
@@ -510,7 +524,7 @@ static void start_identification(int slot)
 
     int32_t ret = 0;
 #ifdef __PROSPERO__
-    ret = scePadVirtualDeviceAddDevice(&param, VIRTUAL_DEVICE_DUALSENSE);
+    ret = scePadVirtualDeviceAddDevice(&param, g_vpad_device_type);
 #endif
     log_line("vpad: slot %d AddDevice -> 0x%08x", slot, (unsigned)ret);
 

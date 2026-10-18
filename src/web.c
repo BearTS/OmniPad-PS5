@@ -1,13 +1,17 @@
 #include "web.h"
 #include "ps5_vpad.h"
 #include "shellui_inject.h"
+#include "bt_host.h"
+#include "web_mappings.h"
 #include "version.h"
 #include "log.h"
 #include "util.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -94,10 +98,50 @@ static const char HTML_INDEX[] =
 "      <button onclick=\"refreshData()\">\n"
 "        <span>&#8635;</span> Refresh\n"
 "      </button>\n"
+"      <button onclick=\"btPair()\" id=\"btPairBtn\">\n"
+"        <span>&#128246;</span> Pair Bluetooth\n"
+"      </button>\n"
+"      <button onclick=\"btDisable()\">\n"
+"        <span>&#9711;</span> Disable BT\n"
+"      </button>\n"
+"      <button onclick=\"window.open('/mappings', '_blank')\">\n"
+"        <span>&#9881;</span> Controller Mappings\n"
+"      </button>\n"
+"      <label style=\"display:inline-flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);padding:6px 10px;border-radius:10px;font-size:13px;\">\n"
+"        Emulate as:\n"
+"        <select id=\"vpadType\" onchange=\"setVpadType(this.value)\" style=\"background:transparent;color:var(--text);border:none;font-size:13px;font-weight:600;\">\n"
+"          <option value=\"3\">DualSense</option>\n"
+"          <option value=\"2\">DualShock 4</option>\n"
+"        </select>\n"
+"      </label>\n"
+"      <label style=\"display:inline-flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);padding:6px 10px;border-radius:10px;font-size:13px;cursor:pointer;\" title=\"Taps the console's Avcap2 haptic stream so game rumble reaches BT pads even when games don't call scePadSetVibration. Experimental.\">\n"
+"        <input type=\"checkbox\" id=\"hapticToggle\" onchange=\"setHaptic(this.checked)\" style=\"accent-color:#3b82f6;\">\n"
+"        Game Rumble (Avcap2)\n"
+"      </label>\n"
+"      <label style=\"display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--border);padding:6px 10px;border-radius:10px;font-size:13px;\" title=\"If no BT pad is connected for this long, OmniPad releases the chip so your idle DualSense can page-scan back in. 0 = never release automatically.\">\n"
+"        Auto-release idle:\n"
+"        <input id=\"idleReleaseMin\" type=\"number\" min=\"0\" max=\"240\" value=\"5\" onchange=\"setIdleRelease(this.value)\" style=\"width:48px;background:transparent;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:2px 4px;font-size:13px;\">\n"
+"        min\n"
+"        <button onclick=\"releaseNow()\" style=\"margin-left:6px;padding:4px 10px;background:transparent;color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;cursor:pointer;\" title=\"Immediately close the Bluetooth chip. Virtual BT pads disconnect; your native DualSense can reconnect right away. Pairing re-opens the chip.\">Release now</button>\n"
+"      </label>\n"
 "      <button class=\"btn-danger\" onclick=\"disconnectAll()\">\n"
 "        <span>&#128268;</span> Disconnect Controllers\n"
 "      </button>\n"
+"      <button class=\"btn-danger\" onclick=\"stopPayload()\">\n"
+"        <span>&#9209;</span> Stop Payload\n"
+"      </button>\n"
 "    </div>\n"
+"    <div id=\"btStatus\" style=\"padding:8px 0;font-size:13px;opacity:.85;\"></div>\n"
+"    <div id=\"hapticTune\" style=\"display:none;padding:4px 0 8px 0;font-size:13px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;\">\n"
+"      <span style=\"opacity:.65\">Rumble gain</span>\n"
+"      <input id=\"hapticGain\" type=\"range\" min=\"0.1\" max=\"4.0\" step=\"0.1\" value=\"1.0\" oninput=\"document.getElementById('hapticGainV').textContent=parseFloat(this.value).toFixed(1)+'x'\" onchange=\"saveHapticSettings()\" style=\"width:200px;accent-color:#3b82f6;\">\n"
+"      <span id=\"hapticGainV\">1.0x</span>\n"
+"      <label style=\"display:inline-flex;align-items:center;gap:6px;cursor:pointer;\" title=\"Keep the Avcap2 stream warm so the first rumble has no cold-start delay. Costs a small amount of CPU while idle.\">\n"
+"        <input id=\"hapticEager\" type=\"checkbox\" onchange=\"saveHapticSettings()\" style=\"accent-color:#3b82f6;\">\n"
+"        Low-latency (keep stream warm)\n"
+"      </label>\n"
+"    </div>\n"
+"    <div id=\"btScanList\" style=\"display:none;padding:4px 0 12px 0;\"></div>\n"
 "\n"
 "    <div class=\"slots-grid\" id=\"slotsContainer\">\n"
 "      <!-- Filled dynamically -->\n"
@@ -178,8 +222,164 @@ static const char HTML_INDEX[] =
 "      refreshData();\n"
 "    }\n"
 "\n"
+"    async function stopPayload() {\n"
+"      if (!confirm('Stop OmniPad PS5?\\n\\nThis will:\\n  1. Disconnect every virtual pad we own\\n  2. Shut down Bluetooth cleanly (restores the chip to the state the system expects)\\n  3. Exit the payload\\n\\nYour native DualSense keeps working.')) return;\n"
+"      /* Shut Bluetooth down FIRST so the HCI chip state is restored before\n"
+"       * the payload exits. Then post /api/exit which drops the stop flag. */\n"
+"      try {\n"
+"        document.getElementById('btStatus').textContent = 'Stopping: disabling BT...';\n"
+"        await fetch('/api/bt/disable', {method:'POST'});\n"
+"        /* small pause so host_close has time to send HCI_Disconnect / restore */\n"
+"        await new Promise(r => setTimeout(r, 1500));\n"
+"        document.getElementById('btStatus').textContent = 'Stopping: exiting payload...';\n"
+"        await fetch('/api/exit', {method:'POST'});\n"
+"      } catch(e) {}\n"
+"      /* The server will be gone within ~1 s; show a final state. */\n"
+"      setTimeout(() => {\n"
+"        document.body.innerHTML = '<div style=\\'padding:40px;text-align:center;color:#94a3b8;font-family:system-ui\\'><h2>Payload stopped</h2><p>Your native DualSense should keep working. If it stops pairing, hard-reboot the console.</p></div>';\n"
+"      }, 2500);\n"
+"    }\n"
+"\n"
+"    async function btPair() {\n"
+"      /* Start a wide scan; the list below populates as devices appear. */\n"
+"      const btn = document.getElementById('btPairBtn');\n"
+"      btn.disabled = true;\n"
+"      try {\n"
+"        await fetch('/api/bt/scan?seconds=90', {method:'POST'});\n"
+"        document.getElementById('btStatus').textContent = 'BT: scanning 90 s \u2014 put your pad in pairing mode now';\n"
+"        document.getElementById('btScanList').style.display = 'block';\n"
+"      } catch(e) {\n"
+"        document.getElementById('btStatus').textContent = 'BT scan failed: ' + e;\n"
+"      }\n"
+"      setTimeout(() => { btn.disabled = false; }, 2000);\n"
+"      refreshBtStatus();\n"
+"      refreshBtDiscovered();\n"
+"    }\n"
+"    async function btPairMac(mac) {\n"
+"      try {\n"
+"        await fetch('/api/bt/pair?mac=' + encodeURIComponent(mac) + '&seconds=120', {method:'POST'});\n"
+"        document.getElementById('btStatus').textContent = 'BT: pairing with ' + mac + '\u2026';\n"
+"      } catch(e) {\n"
+"        document.getElementById('btStatus').textContent = 'BT pair failed: ' + e;\n"
+"      }\n"
+"      refreshBtStatus();\n"
+"    }\n"
+"    function codLabel(cod) {\n"
+"      /* Minor-device class for peripherals (major 5): 1=joystick, 2=gamepad. */\n"
+"      const minor = (cod >> 2) & 0x0F;\n"
+"      if (minor === 2) return 'Gamepad';\n"
+"      if (minor === 1) return 'Joystick';\n"
+"      return 'HID';\n"
+"    }\n"
+"    async function refreshBtDiscovered() {\n"
+"      try {\n"
+"        const r = await fetch('/api/bt/discovered');\n"
+"        const d = await r.json();\n"
+"        const list = document.getElementById('btScanList');\n"
+"        if (!d.devices || d.devices.length === 0) {\n"
+"          list.innerHTML = '<em style=\\'opacity:.6\\'>No gamepads discovered yet. Make sure your pad is in pairing mode (LED fast-blinking).</em>';\n"
+"          return;\n"
+"        }\n"
+"        list.innerHTML = d.devices.map(dev =>\n"
+"          `<div style=\\'display:flex;align-items:center;gap:10px;padding:8px 10px;margin:4px 0;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;\\'>` +\n"
+"          `<code style=\\'flex:1;font-size:13px\\'>${dev.mac}</code>` +\n"
+"          `<span class=\\'pill blue\\'>${codLabel(dev.cod)}</span>` +\n"
+"          `<button onclick=\\'btPairMac(\"${dev.mac}\")\\'>Pair this one</button>` +\n"
+"          `</div>`\n"
+"        ).join('');\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function btDisable() {\n"
+"      try {\n"
+"        await fetch('/api/bt/disable', {method: 'POST'});\n"
+"        document.getElementById('btStatus').textContent = 'BT: disabled';\n"
+"      } catch(e) {}\n"
+"      refreshBtStatus();\n"
+"    }\n"
+"    async function setVpadType(t) {\n"
+"      try {\n"
+"        const r = await fetch('/api/vpad/type?type=' + t, {method:'POST'});\n"
+"        const d = await r.json();\n"
+"        document.getElementById('btStatus').textContent = 'Device type: ' + d.name + ' (reconnect the pad for it to apply)';\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function refreshVpadType() {\n"
+"      try {\n"
+"        const r = await fetch('/api/vpad/type');\n"
+"        const d = await r.json();\n"
+"        const sel = document.getElementById('vpadType');\n"
+"        if (sel) sel.value = String(d.type);\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function setHaptic(on) {\n"
+"      try {\n"
+"        const r = await fetch('/api/bt/haptic?on=' + (on ? '1' : '0'), {method:'POST'});\n"
+"        const d = await r.json();\n"
+"        document.getElementById('btStatus').textContent = 'Game Rumble (Avcap2): ' + (d.haptic ? 'on' : 'off');\n"
+"        document.getElementById('hapticTune').style.display = d.haptic ? 'flex' : 'none';\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function refreshHaptic() {\n"
+"      try {\n"
+"        const r = await fetch('/api/bt/haptic');\n"
+"        const d = await r.json();\n"
+"        const box = document.getElementById('hapticToggle');\n"
+"        if (box) box.checked = !!d.haptic;\n"
+"        document.getElementById('hapticTune').style.display = d.haptic ? 'flex' : 'none';\n"
+"        const r2 = await fetch('/api/bt/haptic/settings');\n"
+"        const s = await r2.json();\n"
+"        const g = document.getElementById('hapticGain');\n"
+"        if (g) { g.value = s.gain; document.getElementById('hapticGainV').textContent = parseFloat(s.gain).toFixed(1)+'x'; }\n"
+"        const e = document.getElementById('hapticEager');\n"
+"        if (e) e.checked = !!s.eager;\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function setIdleRelease(m) {\n"
+"      try {\n"
+"        await fetch('/api/bt/idle_release?minutes=' + m, {method:'POST'});\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function releaseNow() {\n"
+"      try {\n"
+"        await fetch('/api/bt/disable', {method:'POST'});\n"
+"        document.getElementById('btStatus').textContent = 'BT: released — your DualSense can reconnect now';\n"
+"      } catch(e) {}\n"
+"      refreshBtStatus();\n"
+"    }\n"
+"    async function refreshIdleRelease() {\n"
+"      try {\n"
+"        const r = await fetch('/api/bt/idle_release');\n"
+"        const d = await r.json();\n"
+"        const el = document.getElementById('idleReleaseMin');\n"
+"        if (el) el.value = d.minutes;\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function saveHapticSettings() {\n"
+"      const gain = document.getElementById('hapticGain').value;\n"
+"      const eager = document.getElementById('hapticEager').checked ? '1' : '0';\n"
+"      try {\n"
+"        await fetch('/api/bt/haptic/settings?gain=' + gain + '&eager=' + eager, {method:'POST'});\n"
+"      } catch(e) {}\n"
+"    }\n"
+"    async function refreshBtStatus() {\n"
+"      try {\n"
+"        const r = await fetch('/api/bt/status');\n"
+"        const s = await r.json();\n"
+"        const el = document.getElementById('btStatus');\n"
+"        if (s.pairing) el.textContent = 'BT: pairing — ' + s.pairing_left + 's left';\n"
+"        else if (s.up) el.textContent = 'BT: host up';\n"
+"        else el.textContent = 'BT: off (click Pair Bluetooth to start)';\n"
+"      } catch(e) {}\n"
+"    }\n"
+"\n"
 "    setInterval(refreshData, 1000);\n"
+"    setInterval(refreshBtStatus, 2000);\n"
+"    setInterval(() => { if (document.getElementById('btScanList').style.display !== 'none') refreshBtDiscovered(); }, 2000);\n"
 "    refreshData();\n"
+"    refreshBtStatus();\n"
+"    refreshVpadType();\n"
+"    refreshHaptic();\n"
+"    refreshIdleRelease();\n"
 "  </script>\n"
 "</body>\n"
 "</html>\n";
@@ -484,6 +684,328 @@ static void handle_client(int cfd)
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
             strlen(ok), ok);
         write(cfd, res, (size_t)res_len);
+    }
+    /* ---- Bluetooth control endpoints ---- */
+    else if (strncmp(req, "GET /api/bt/status", 18) == 0) {
+        char body[512];
+        int up = bt_host_is_up();
+        int left = bt_host_get_pairing_seconds_left();
+        int blen = snprintf(body, sizeof body,
+            "{\"up\":%s,\"pairing\":%s,\"pairing_left\":%d}",
+            up ? "true":"false", left > 0 ? "true":"false", left);
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/bt/scan", 17) == 0) {
+        /* Open the BT chip and run inquiry WITHOUT a MAC filter: on_discover
+         * records every gamepad-class device it hears; dashboard reads
+         * /api/bt/discovered to render the list. Still auto-pairs any pad
+         * in pairing mode; the dashboard "Pair this one" flow swaps in a
+         * MAC filter via /api/bt/pair?mac=... before clicking. */
+        int seconds = 90;
+        const char *p = strstr(req, "seconds=");
+        if (p) seconds = atoi(p + 8);
+        if (seconds <= 0 || seconds > 300) seconds = 90;
+        int ok = bt_host_is_up() || bt_host_init();
+        if (ok) {
+            /* Clear any lingering MAC filter so the scan is wide-open. */
+            unsigned char zero[6] = {0};
+            extern void host_set_allowed_mac(void *, const unsigned char[6]);
+            /* bt_host doesn't expose the host_t pointer; use the public
+             * bt_host_pair_mac(NULL,...) path implicitly by starting a
+             * normal pair window instead. */
+            (void)zero; (void)host_set_allowed_mac;
+            bt_host_start_pairing(seconds);
+        }
+        const char *body = ok ? "{\"status\":\"scanning\"}" : "{\"status\":\"bt_init_failed\"}";
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n"
+            "Connection: close\r\n\r\n%s",
+            ok ? "200 OK" : "503 Service Unavailable", strlen(body), body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/bt/haptic", 19) == 0) {
+        const char *p = strstr(req, "on=");
+        int on = p && (p[3] == '1' || p[3] == 't');
+        bt_haptic_enable(on);
+        char body[64];
+        int blen = snprintf(body, sizeof body, "{\"haptic\":%s}", on ? "true" : "false");
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/bt/idle_release", 25) == 0) {
+        const char *p = strstr(req, "minutes=");
+        int m = p ? atoi(p + 8) : 5;
+        bt_host_idle_release_set(m);
+        char body[64];
+        int blen = snprintf(body, sizeof body, "{\"minutes\":%d}", bt_host_idle_release_get());
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "GET /api/bt/idle_release", 24) == 0) {
+        char body[64];
+        int blen = snprintf(body, sizeof body, "{\"minutes\":%d}", bt_host_idle_release_get());
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "GET /api/bt/haptic/settings", 27) == 0) {
+        float gain; int eager;
+        bt_haptic_settings_get(&gain, &eager);
+        char body[96];
+        int blen = snprintf(body, sizeof body,
+            "{\"gain\":%.2f,\"eager\":%s}", gain, eager ? "true" : "false");
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/bt/haptic/settings", 28) == 0) {
+        float gain; int eager;
+        bt_haptic_settings_get(&gain, &eager);
+        const char *p = strstr(req, "gain=");
+        if (p) gain = (float)atof(p + 5);
+        p = strstr(req, "eager=");
+        if (p) eager = (p[6] == '1' || p[6] == 't');
+        bt_haptic_settings_set(gain, eager);
+        bt_haptic_settings_get(&gain, &eager);
+        char body[96];
+        int blen = snprintf(body, sizeof body,
+            "{\"gain\":%.2f,\"eager\":%s}", gain, eager ? "true" : "false");
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "GET /api/bt/haptic", 18) == 0) {
+        char body[64];
+        int blen = snprintf(body, sizeof body, "{\"haptic\":%s}",
+                            bt_haptic_is_enabled() ? "true" : "false");
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "GET /api/vpad/type", 18) == 0) {
+        int t = vpad_get_device_type();
+        char body[64];
+        int blen = snprintf(body, sizeof body,
+            "{\"type\":%d,\"name\":\"%s\"}",
+            t, t == 2 ? "DualShock 4" : "DualSense");
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/vpad/type", 19) == 0) {
+        const char *p = strstr(req, "type=");
+        int t = p ? atoi(p + 5) : 0;
+        int before = vpad_get_device_type();
+        vpad_set_device_type(t);
+        int after = vpad_get_device_type();
+        int changed = (before != after);
+        char body[128];
+        int blen = snprintf(body, sizeof body,
+            "{\"type\":%d,\"name\":\"%s\",\"changed\":%s,\"note\":\"applies to next virtual pad; reconnect\"}",
+            after, after == 2 ? "DualShock 4" : "DualSense", changed ? "true" : "false");
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "GET /api/bt/discovered", 22) == 0) {
+        bt_discovered_t rows[16];
+        int n = bt_host_discovered(rows, 16);
+        char body[1024]; int blen = 0;
+        blen += snprintf(body + blen, sizeof body - blen, "{\"devices\":[");
+        long now = now_ms();
+        for (int i = 0; i < n && blen < (int)sizeof body - 100; i++) {
+            blen += snprintf(body + blen, sizeof body - blen,
+                "%s{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"cod\":%u,\"age_ms\":%ld}",
+                i ? "," : "",
+                rows[i].mac[5], rows[i].mac[4], rows[i].mac[3],
+                rows[i].mac[2], rows[i].mac[1], rows[i].mac[0],
+                rows[i].cod, now - rows[i].last_seen_ms);
+        }
+        blen += snprintf(body + blen, sizeof body - blen, "]}");
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n%s", blen, body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/bt/pair", 17) == 0) {
+        /* Pair a specific MAC: ?mac=AA:BB:CC:DD:EE:FF&seconds=120.
+         * Without ?mac, falls back to a wide scan window (backwards-
+         * compatible with the earlier UI). */
+        int seconds = 120;
+        unsigned char mac[6] = {0};
+        int have_mac = 0;
+        const char *p = strstr(req, "seconds=");
+        if (p) seconds = atoi(p + 8);
+        if (seconds <= 0 || seconds > 300) seconds = 120;
+        p = strstr(req, "mac=");
+        if (p) {
+            p += 4;
+            unsigned x[6];
+            if (sscanf(p, "%2x%*[:%-]%2x%*[:%-]%2x%*[:%-]%2x%*[:%-]%2x%*[:%-]%2x",
+                       &x[5],&x[4],&x[3],&x[2],&x[1],&x[0]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (unsigned char)x[i];
+                have_mac = 1;
+            }
+        }
+        int ok;
+        if (have_mac) {
+            ok = bt_host_pair_mac(mac, seconds);
+        } else {
+            ok = bt_host_is_up() || bt_host_init();
+            if (ok) bt_host_start_pairing(seconds);
+        }
+        const char *body = ok ? "{\"status\":\"pairing_started\"}" : "{\"status\":\"bt_init_failed\"}";
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n"
+            "Connection: close\r\n\r\n%s",
+            ok ? "200 OK" : "503 Service Unavailable", strlen(body), body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/bt/disable", 20) == 0) {
+        bt_host_cleanup();
+        const char *body = "{\"status\":\"bt_disabled\"}";
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n"
+            "Connection: close\r\n\r\n%s", strlen(body), body);
+        write(cfd, res, (size_t)res_len);
+    }
+    else if (strncmp(req, "POST /api/bt/forget", 19) == 0) {
+        /* Accepts ?mac=AA:BB:... Not implemented in the facade yet. */
+        const char *body = "{\"status\":\"not_implemented\"}";
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 501 Not Implemented\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n"
+            "Connection: close\r\n\r\n%s", strlen(body), body);
+        write(cfd, res, (size_t)res_len);
+    }
+    /* ---- Mapping (per-controller button remap) endpoints ---- */
+    else if (strncmp(req, "GET /api/mapping/", 17) == 0) {
+        char path[256]; char id[16] = {0};
+        /* Pull VVVV_PPPP token after /api/mapping/ */
+        const char *p = req + 17;
+        size_t n_id = 0;
+        while (n_id + 1 < sizeof id && isalnum((unsigned char)*p)) id[n_id++] = *p++;
+        snprintf(path, sizeof path, "/data/omnipad/maps/%s.map", id);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            /* Convert the .map file lines (key = value) into a JSON object. */
+            char body[1024]; int blen = 0;
+            blen += snprintf(body + blen, sizeof body - blen, "{");
+            char line[128]; int first = 1;
+            while (fgets(line, sizeof line, f) && blen < (int)sizeof body - 80) {
+                char *hash = strchr(line, '#'); if (hash) *hash = 0;
+                char *eq = strchr(line, '='); if (!eq) continue;
+                *eq = 0; char *k = line, *v = eq + 1;
+                while (*k == ' ' || *k == '\t') k++;
+                char *ke = k + strlen(k); while (ke > k && (ke[-1]==' '||ke[-1]=='\t'||ke[-1]=='\n'||ke[-1]=='\r')) *--ke = 0;
+                while (*v == ' ' || *v == '\t') v++;
+                char *ve = v + strlen(v); while (ve > v && (ve[-1]==' '||ke[-1]=='\t'||ve[-1]=='\n'||ve[-1]=='\r')) *--ve = 0;
+                if (!*k) continue;
+                blen += snprintf(body + blen, sizeof body - blen,
+                                 "%s\"%s\":\"%s\"", first ? "" : ",", k, v);
+                first = 0;
+            }
+            fclose(f);
+            blen += snprintf(body + blen, sizeof body - blen, "}");
+            res_len = snprintf(res, sizeof(res),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+                "Connection: close\r\n\r\n%s", blen, body);
+            write(cfd, res, (size_t)res_len);
+        } else {
+            const char *body = "{\"error\":\"not_found\"}";
+            res_len = snprintf(res, sizeof(res),
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n"
+                "Connection: close\r\n\r\n%s", strlen(body), body);
+            write(cfd, res, (size_t)res_len);
+        }
+    }
+    else if (strncmp(req, "POST /api/mapping/", 18) == 0) {
+        /* Dashboard POSTs a flat JSON object; we persist it as key=value lines. */
+        char id[16] = {0};
+        const char *p = req + 18;
+        size_t n_id = 0;
+        while (n_id + 1 < sizeof id && isalnum((unsigned char)*p)) id[n_id++] = *p++;
+        char *body_start = strstr(req, "\r\n\r\n");
+        if (body_start) body_start += 4; else body_start = (char*)req + n;
+        mkdir("/data/omnipad", 0755);
+        mkdir("/data/omnipad/maps", 0755);
+        char path[256];
+        snprintf(path, sizeof path, "/data/omnipad/maps/%s.map", id);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            const char *body = "{\"error\":\"write_failed\"}";
+            res_len = snprintf(res, sizeof(res),
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n"
+                "Connection: close\r\n\r\n%s", strlen(body), body);
+            write(cfd, res, (size_t)res_len);
+        } else {
+            fprintf(f, "# OmniPad: written by the mappings page.\n");
+            /* Shallow key:value extraction — assumes a flat object with string
+             * values, which is what the mappings page sends. */
+            char *cur = body_start;
+            while (cur && *cur) {
+                char *k = strchr(cur, '"'); if (!k) break;
+                char *k_end = strchr(k + 1, '"'); if (!k_end) break;
+                char *colon = strchr(k_end, ':'); if (!colon) break;
+                char *v = strchr(colon, '"'); if (!v) break;
+                char *v_end = strchr(v + 1, '"'); if (!v_end) break;
+                *k_end = 0; *v_end = 0;
+                fprintf(f, "%s = %s\n", k + 1, v + 1);
+                cur = v_end + 1;
+            }
+            fclose(f);
+            const char *body = "{\"status\":\"saved\"}";
+            res_len = snprintf(res, sizeof(res),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n"
+                "Connection: close\r\n\r\n%s", strlen(body), body);
+            write(cfd, res, (size_t)res_len);
+        }
+    }
+    else if (strncmp(req, "GET /mappings", 13) == 0) {
+        /* Serve the embedded mappings page (writes header + body in two
+         * sends so we don't need a 25 KB stack buffer). */
+        res_len = snprintf(res, sizeof(res),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n"
+            "Cache-Control: no-cache\r\nContent-Length: %zu\r\n"
+            "Connection: close\r\n\r\n", HTML_MAPPINGS_LEN);
+        write(cfd, res, (size_t)res_len);
+        /* Chunked write to tolerate small write() returns on slow clients. */
+        size_t off = 0;
+        while (off < HTML_MAPPINGS_LEN) {
+            ssize_t w = write(cfd, HTML_MAPPINGS + off, HTML_MAPPINGS_LEN - off);
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
     }
     else {
         /* Serve Web Dashboard HTML */
